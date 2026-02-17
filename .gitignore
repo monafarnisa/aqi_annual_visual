@@ -1,0 +1,19 @@
+# Data (optional: remove if you want to track sample data)
+data/raw/
+data/processed/
+data/idw/
+
+# Outputs
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
