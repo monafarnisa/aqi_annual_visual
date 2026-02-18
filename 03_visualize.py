@@ -22,6 +22,8 @@ PROCESSED_DIR = DATA_DIR / "processed"
 IDW_DIR = DATA_DIR / "idw"
 OUT_DIR = Path(__file__).resolve().parent / "outputs"
 YEARS = list(range(2020, 2026))
+MAX_PIVOT_CELLS = 4_000_000
+USE_BASEMAP = False
 
 
 def load_data():
@@ -52,21 +54,31 @@ def viz1_trend_by_year(df: pd.DataFrame):
 def viz2_to_5_maps(df: pd.DataFrame, years_to_plot=(2020, 2021, 2022, 2023, 2024, 2025)):
     """Visualizations 2–7: One map per year (2020–2025) using IDW grid if available, else points."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for i, year in enumerate(years_to_plot):
+    for year in years_to_plot:
         fig, ax = plt.subplots(figsize=(10, 6))
         idw_path = IDW_DIR / f"idw_{year}.csv"
         if idw_path.exists():
             grid_df = pd.read_csv(idw_path)
             lon_vals = np.sort(grid_df["lon"].unique())
             lat_vals = np.sort(grid_df["lat"].unique())
-            if len(lon_vals) > 1 and len(lat_vals) > 1:
+            n_cells = len(lon_vals) * len(lat_vals)
+            is_dense_grid = n_cells == len(grid_df)
+            if len(lon_vals) > 1 and len(lat_vals) > 1 and is_dense_grid and n_cells <= MAX_PIVOT_CELLS:
                 pivot = grid_df.pivot(index="lat", columns="lon", values="days_above_100")
                 pivot = pivot.reindex(index=lat_vals, columns=lon_vals)
                 Z = pivot.values
                 im = ax.pcolormesh(lon_vals, lat_vals, Z, cmap="YlOrRd", shading="auto", vmin=0)
                 plt.colorbar(im, ax=ax, label="Days above AQI 100")
             else:
-                sc = ax.scatter(grid_df["lon"], grid_df["lat"], c=grid_df["days_above_100"], cmap="YlOrRd", s=2)
+                # Fallback for irregular point grids (e.g. projected grid reprojected to EPSG:4326)
+                sc = ax.scatter(
+                    grid_df["lon"],
+                    grid_df["lat"],
+                    c=grid_df["days_above_100"],
+                    cmap="YlOrRd",
+                    s=2,
+                    linewidths=0,
+                )
                 plt.colorbar(sc, ax=ax, label="Days above AQI 100")
         else:
             sub = df[df["Year"] == year].dropna(subset=["Longitude", "Latitude"])
@@ -77,13 +89,12 @@ def viz2_to_5_maps(df: pd.DataFrame, years_to_plot=(2020, 2021, 2022, 2023, 2024
                 continue
             sc = ax.scatter(sub["Longitude"], sub["Latitude"], c=sub["days_above_100"], cmap="YlOrRd", s=15, alpha=0.8)
             plt.colorbar(sc, ax=ax, label="Days above AQI 100")
-        ax.set_xlim(-125, -66)
-        ax.set_ylim(24, 50)
-        ax.set_aspect("equal")
+        ax.set_xlim(-179, -65)
+        ax.set_ylim(17, 73)
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
         ax.set_title(f"Days Above AQI 100 — {year}")
-        if HAS_CTX:
+        if HAS_CTX and USE_BASEMAP:
             try:
                 ctx.add_basemap(ax, crs="EPSG:4326", source=ctx.providers.CartoDB.Positron, zoom=4)
             except Exception:

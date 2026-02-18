@@ -1,179 +1,221 @@
 """
 01_clean_aqi_days_above_100.py
-Clean AQI data and calculate days above AQI 100 per monitor per year (2020-2025).
-Python equivalent of 01_us_calculate_days_above_aqi.R.
+Build a site-level yearly table of days above AQI 100 (2020-2025).
 """
 
-import pandas as pd
-import numpy as np
 from pathlib import Path
+
+import pandas as pd
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 DATA_DIR = Path(__file__).resolve().parent / "data"
 RAW_DIR = DATA_DIR / "raw"
-OUT_DIR = DATA_DIR / "processed"
-YEARS = list(range(2020, 2026))  # 2020 through 2025
+INTERMEDIATE_DIR = DATA_DIR / "processed"
+YEARS = list(range(2020, 2026))
 AQI_THRESHOLD = 100
 
-# EPA AirData daily files: one CSV per year per pollutant.
-# Download from: https://aqs.epa.gov/aqsweb/airdata/download_files.html
-# e.g. daily_44201_2020.zip (PM2.5), daily_42401_2020.zip (Ozone)
-# This script expects either:
-#   - raw/daily_44201_YYYY.csv (PM2.5) and/or daily_42401_YYYY.csv (Ozone)
-#   - or a single combined daily file with columns: Date, AQI, State Code, County Code, Site Num, Lat, Lon
-# We use "daily_aqi_by_cbsa" or "daily_44201" (PM2.5) if available; otherwise document manual download.
-# -----------------------------------------------------------------------------
 
-
-def ensure_dirs():
-    """Create data directories if they don't exist."""
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_daily_aqi_for_year(year: int):
-    """
-    Load daily AQI data for one year.
-    Expects EPA AirData format: daily_44201_YYYY.csv (PM2.5) or similar.
-    Columns typically: State Code, County Code, Site Num, Parameter Code,
-    POC, Lat, Lon, Date, Daily Mean PM2.5 Concentration, AQI, etc.
-    """
-    # Try PM2.5 daily (parameter 44201)
-    path_pm25 = RAW_DIR / f"daily_44201_{year}.csv"
-    if path_pm25.exists():
-        df = pd.read_csv(path_pm25)
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"])
-        return df
-
-    # Try generic daily AQI file name
-    path_gen = RAW_DIR / f"daily_aqi_{year}.csv"
-    if path_gen.exists():
-        df = pd.read_csv(path_gen)
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        return df.dropna(subset=["Date"]) if "Date" in df.columns else df
-
-    return None
-
-
-def get_aqi_column(df: pd.DataFrame) -> str:
-    """Identify the AQI column (EPA uses 'AQI' or 'DAILY_AQI_VALUE')."""
-    for col in ["AQI", "DAILY_AQI_VALUE", "daily_aqi"]:
-        if col in df.columns:
-            return col
-    # Some files have "Arithmetic Mean" for concentration; we need AQI. If only concentration, we could convert.
-    return ""
-
-
-def site_id(df: pd.DataFrame) -> pd.Series:
-    """Create a unique site identifier from State, County, Site Number (and Lat/Lon if present)."""
-    state = df["State Code"].astype(str).str.zfill(2) if "State Code" in df.columns else pd.Series(["00"] * len(df), index=df.index)
-    county = df["County Code"].astype(str).str.zfill(3) if "County Code" in df.columns else pd.Series(["000"] * len(df), index=df.index)
-    site = df["Site Num"].astype(str) if "Site Num" in df.columns else df.index.astype(str)
-    return state + "-" + county + "-" + site
-
-
-def clean_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Clean daily AQI data: drop missing AQI, ensure numeric, optional bounds.
-    """
-    aqi_col = get_aqi_column(df)
-    if not aqi_col:
-        raise ValueError(
-            "No AQI column found. Expected one of: AQI, DAILY_AQI_VALUE, daily_aqi. "
-            f"Columns: {list(df.columns)}"
-        )
-    out = df[["Date", aqi_col]].copy()
-    out = out.rename(columns={aqi_col: "AQI"})
-    out["AQI"] = pd.to_numeric(out["AQI"], errors="coerce")
-    out = out.dropna(subset=["AQI"])
-    # Optional: clamp to valid AQI range 0–500
-    out["AQI"] = out["AQI"].clip(0, 500)
-    # Keep site and location for merging
-    for col in ["State Code", "County Code", "Site Num", "Latitude", "Longitude", "Lat", "Lon"]:
-        if col in df.columns:
-            out[col] = df[col].values
-    if "Latitude" not in out.columns and "Lat" in df.columns:
-        out["Latitude"] = df["Lat"]
-        out["Longitude"] = df["Lon"]
-    out["Site_ID"] = site_id(df) if "State Code" in df.columns else df.index.astype(str)
-    return out
-
-
-def days_above_aqi_per_site_year(daily_clean: pd.DataFrame, threshold: int = AQI_THRESHOLD) -> pd.DataFrame:
-    """
-    For each site and year, count days where AQI > threshold.
-    """
-    daily_clean = daily_clean.copy()
-    daily_clean["Year"] = daily_clean["Date"].dt.year
-    above = daily_clean[daily_clean["AQI"] > threshold]
-    counts = (
-        above.groupby(["Site_ID", "Year"], dropna=False)
-        .size()
-        .reset_index(name="days_above_100")
+def snake_case_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = (
+        df.columns.str.strip()
+        .str.lower()
+        .str.replace(" ", "_", regex=False)
     )
-    # One row per site with lat/lon (take first occurrence)
-    geo_cols = {}
-    if "Latitude" in daily_clean.columns:
-        geo_cols["Latitude"] = ("Latitude", "first")
-    elif "Lat" in daily_clean.columns:
-        geo_cols["Latitude"] = ("Lat", "first")
-    if "Longitude" in daily_clean.columns:
-        geo_cols["Longitude"] = ("Longitude", "first")
-    elif "Lon" in daily_clean.columns:
-        geo_cols["Longitude"] = ("Lon", "first")
-    if geo_cols:
-        site_geo = daily_clean.groupby("Site_ID").agg(**geo_cols).reset_index()
+    return df
+
+
+def _compose_defining_site(
+    state_code: pd.Series,
+    county_code: pd.Series,
+    site_code: pd.Series,
+) -> pd.Series:
+    return (
+        state_code.astype(str).str.strip().str.zfill(2)
+        + "-"
+        + county_code.astype(str).str.strip().str.zfill(3)
+        + "-"
+        + site_code.astype(str).str.strip().str.zfill(4)
+    )
+
+
+def _normalize_defining_site(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+
+    split = s.str.split("-", expand=True)
+    if split.shape[1] == 3:
+        return _compose_defining_site(split[0], split[1], split[2])
+    return s
+
+
+def process_aqi_data_left(aqi_data: pd.DataFrame, aqi_threshold: int = 100) -> pd.DataFrame:
+    days_col = f"days_above_{aqi_threshold}"
+
+    aqi_days_count = (
+        aqi_data.loc[aqi_data["aqi"] > aqi_threshold]
+        .groupby("defining_site", as_index=False)
+        .size()
+        .rename(columns={"size": "days"})
+    )
+
+    site_info = (
+        aqi_data.sort_values("defining_site")
+        .drop_duplicates(subset="defining_site", keep="first")
+        .copy()
+    )
+
+    out = site_info.merge(aqi_days_count, on="defining_site", how="left")
+    out["days"] = out["days"].fillna(0).astype(int)
+
+    drop_cols = ["date", "aqi", "category", "number_of_sites_reporting", "defining_parameter"]
+    out = out.drop(columns=[c for c in drop_cols if c in out.columns])
+
+    return out.rename(columns={"days": days_col})
+
+
+def _load_daily_csv(raw_data_dir: Path, year: int, daily_filename_template: str) -> pd.DataFrame:
+    candidates = [
+        raw_data_dir / daily_filename_template.format(year=year),
+        raw_data_dir / f"daily_aqi_by_county_{year}.csv",
+        raw_data_dir / f"daily_aqi_by_site_{year}.csv",
+        raw_data_dir / f"daily_44201_{year}.csv",
+        raw_data_dir / f"daily_aqi_{year}.csv",
+    ]
+
+    for path in candidates:
+        if path.exists():
+            print(f"Using daily file: {path.name}")
+            return pd.read_csv(path).pipe(snake_case_cols)
+
+    raise FileNotFoundError(
+        "No daily AQI file found for year "
+        f"{year}. Looked for {[p.name for p in candidates]} in {raw_data_dir}."
+    )
+
+
+def run_days_above_100_workflow(
+    year: int,
+    raw_data_dir: Path,
+    intermediate_dir: Path,
+    daily_filename_template: str = "daily_aqi_by_site_{year}.csv",
+    sites_filename: str = "aqs_sites.csv",
+    threshold: int = 100,
+    max_missing_coord_frac: float = 0.01,   # fail if >1% missing coords
+) -> pd.DataFrame:
+    daily = _load_daily_csv(raw_data_dir, year, daily_filename_template)
+
+    if "aqi" not in daily.columns:
+        raise ValueError(f"Missing required column 'aqi' in daily data for {year}.")
+
+    if "defining_site" not in daily.columns:
+        required = {"state_code", "county_code", "site_num"}
+        if not required.issubset(set(daily.columns)):
+            raise ValueError(
+                "Missing 'defining_site' and missing components to build it. "
+                "Expected either defining_site or state_code/county_code/site_num."
+            )
+        daily["defining_site"] = _compose_defining_site(
+            daily["state_code"], daily["county_code"], daily["site_num"]
+        )
     else:
-        site_geo = counts[["Site_ID"]].drop_duplicates()
-    result = counts.merge(site_geo, on="Site_ID", how="left")
-    return result
+        daily["defining_site"] = _normalize_defining_site(daily["defining_site"])
+
+    sites_path = raw_data_dir / sites_filename
+    if sites_path.exists():
+        sites = pd.read_csv(sites_path).pipe(snake_case_cols)
+        if "defining_site" not in sites.columns:
+            needed = {"state_code", "county_code", "site_number"}
+            if not needed.issubset(set(sites.columns)):
+                raise ValueError(
+                    "Site file is missing 'defining_site' and missing components "
+                    "state_code/county_code/site_number."
+                )
+            sites["defining_site"] = _compose_defining_site(
+                sites["state_code"], sites["county_code"], sites["site_number"]
+            )
+        else:
+            sites["defining_site"] = _normalize_defining_site(sites["defining_site"])
+
+        daily["defining_site"] = daily["defining_site"].astype(str)
+        sites["defining_site"] = sites["defining_site"].astype(str)
+
+        daily_coords = daily.merge(
+            sites[["defining_site", "latitude", "longitude"]],
+            on="defining_site",
+            how="left",
+        )
+    else:
+        # If no site table exists, use coordinates already present in daily file.
+        daily_coords = daily.copy()
+        if "latitude" not in daily_coords.columns and "lat" in daily_coords.columns:
+            daily_coords["latitude"] = daily_coords["lat"]
+        if "longitude" not in daily_coords.columns and "lon" in daily_coords.columns:
+            daily_coords["longitude"] = daily_coords["lon"]
+
+    if "latitude" not in daily_coords.columns or "longitude" not in daily_coords.columns:
+        raise ValueError(
+            f"No usable latitude/longitude columns for year {year}. "
+            "Provide aqs_sites.csv or include lat/lon in daily file."
+        )
+
+    missing_frac = daily_coords["latitude"].isna().mean()
+    if missing_frac > max_missing_coord_frac:
+        raise ValueError(
+            f"Too many missing coordinates after join: {missing_frac:.2%}. "
+            "Check defining_site formatting / site table."
+        )
+
+    days_above = process_aqi_data_left(daily_coords, aqi_threshold=threshold)
+    days_above["year"] = year
+
+    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = intermediate_dir / f"us_days_above_{threshold}_{year}.csv"
+    days_above.to_csv(out_csv, index=False)
+    print(f"Saved: {out_csv}")
+
+    return days_above
 
 
-def run_all_years() -> pd.DataFrame:
-    """Load, clean, and compute days above AQI 100 for all years; combine into one long table."""
-    ensure_dirs()
-    all_site_years = []
+def run_all_years_workflow() -> pd.DataFrame:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
 
+    yearly_frames = []
     for year in YEARS:
-        df = load_daily_aqi_for_year(year)
-        if df is None:
-            print(f"No data found for {year}. Place EPA AirData daily CSV in {RAW_DIR} (e.g. daily_44201_{year}.csv).")
-            continue
-        cleaned = clean_daily(df)
-        site_year = days_above_aqi_per_site_year(cleaned)
-        all_site_years.append(site_year)
+        try:
+            yearly = run_days_above_100_workflow(
+                year=year,
+                raw_data_dir=RAW_DIR,
+                intermediate_dir=INTERMEDIATE_DIR,
+                threshold=AQI_THRESHOLD,
+            )
+            yearly_frames.append(yearly)
+        except FileNotFoundError as exc:
+            print(exc)
+        except ValueError as exc:
+            print(f"Skipping {year}: {exc}")
 
-    if not all_site_years:
-        # Create synthetic example so IDW and viz scripts can run
-        print("No EPA data found. Writing synthetic example data for 2020-2025.")
-        rng = np.random.default_rng(42)
-        n_sites = 50
-        lats = rng.uniform(25, 49, n_sites)
-        lons = rng.uniform(-125, -66, n_sites)
-        site_ids = [f"site_{i:03d}" for i in range(n_sites)]
-        rows = []
-        for year in YEARS:
-            for i in range(n_sites):
-                rows.append({
-                    "Site_ID": site_ids[i],
-                    "Year": year,
-                    "days_above_100": int(rng.integers(0, 60)),
-                    "Latitude": lats[i],
-                    "Longitude": lons[i],
-                })
-        combined = pd.DataFrame(rows)
-    else:
-        combined = pd.concat(all_site_years, ignore_index=True)
+    if not yearly_frames:
+        raise RuntimeError(
+            "No yearly outputs were created. Add raw files in data/raw and re-run."
+        )
 
-    out_path = OUT_DIR / "days_above_aqi100_by_site_year.csv"
-    combined.to_csv(out_path, index=False)
-    print(f"Wrote {out_path} with {len(combined)} rows.")
+    combined = pd.concat(yearly_frames, ignore_index=True)
+    combined = combined.rename(
+        columns={
+            "year": "Year",
+            "latitude": "Latitude",
+            "longitude": "Longitude",
+        }
+    )
+
+    out_combined = INTERMEDIATE_DIR / "days_above_aqi100_by_site_year.csv"
+    combined.to_csv(out_combined, index=False)
+    print(f"Wrote {out_combined} with {len(combined)} rows.")
     return combined
 
 
 if __name__ == "__main__":
-    run_all_years()
+    run_all_years_workflow()
