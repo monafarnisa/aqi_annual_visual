@@ -2,11 +2,7 @@
 03_visualize.py
 Five data visualizations: days above AQI 100 by year (2020-2025).
 1. Trend: mean days above AQI 100 per year (bar or line).
-2. Map 2020: IDW surface of days above AQI 100.
-3. Map 2021
-4. Map 2022
-5. Map 2023
-(Additional years 2024, 2025 follow the same map style; script can be extended.)
+2–7. One map per year (2020–2025): IDW surface of days above AQI 100.
 """
 
 import numpy as np
@@ -53,8 +49,8 @@ def viz1_trend_by_year(df: pd.DataFrame):
     print(f"Saved {OUT_DIR / '01_trend_days_above_aqi100_by_year.png'}")
 
 
-def viz2_to_5_maps(df: pd.DataFrame, years_to_plot=(2020, 2021, 2022, 2023)):
-    """Visualizations 2–5: One map per year (4 maps) using IDW grid if available, else points."""
+def viz2_to_5_maps(df: pd.DataFrame, years_to_plot=(2020, 2021, 2022, 2023, 2024, 2025)):
+    """Visualizations 2–7: One map per year (2020–2025) using IDW grid if available, else points."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for i, year in enumerate(years_to_plot):
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -101,8 +97,8 @@ def viz2_to_5_maps(df: pd.DataFrame, years_to_plot=(2020, 2021, 2022, 2023)):
 def main():
     df = load_data()
     viz1_trend_by_year(df)
-    # Five visualizations: 1 trend + 4 maps (2020–2023)
-    viz2_to_5_maps(df, years_to_plot=(2020, 2021, 2022, 2023))
+    # 1 trend + one map per year (2020–2025)
+    viz2_to_5_maps(df, years_to_plot=(2020, 2021, 2022, 2023, 2024, 2025))
     print("Done. Check the 'outputs' folder.")
 
 

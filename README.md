@@ -8,7 +8,7 @@ Calculate **days above AQI 100** per year (2020–2025) and produce **five data 
 2. **Interpolate** with **Inverse Distance Weighted (IDW)** to create continuous surfaces.
 3. **Visualize**:  
    - **Viz 1:** Trend chart — mean days above AQI 100 per year (2020–2025).  
-   - **Viz 2–5:** One map per year (2020, 2021, 2022, 2023) showing the IDW surface (or monitor points if no IDW).
+   - **Viz 2–7:** One map per year (2020–2025) showing the IDW surface (or monitor points if no IDW).
 
 ## Setup
 
@@ -27,9 +27,25 @@ pip install -r requirements.txt
   - `daily_42401_YYYY.csv` for ozone.
 - If no files are present, the cleaning script generates **synthetic example data** so you can run the full pipeline and see the visualizations.
 
+### Including your 5 CSV files (~25 MB each)
+
+You have **five CSVs at ~25 MB each** (~125 MB total). Best options:
+
+| Approach | When to use |
+|----------|-------------|
+| **Keep raw data out of Git (recommended)** | Repo stays small; others run the pipeline with their own download. `data/raw/` is already in `.gitignore`. Download EPA ZIPs, unzip into `data/raw/`, and run the pipeline. Use the optional script: `python scripts/download_raw_data.py` (see below). |
+| **Git LFS** | You want the exact 5 files versioned and shared via the repo. Run `git lfs install`, then `git lfs track "data/raw/*.csv"`, add and commit. Note: GitHub LFS has bandwidth/storage limits on free plans. |
+| **DVC (Data Version Control)** | Best for large data and reproducibility: data lives in remote storage (S3, GCS, or a shared drive); the repo stores only small pointer files. See [dvc.org](https://dvc.org). |
+| **External storage + script** | Store the 5 CSVs in Google Drive, S3, or similar; add a small script or README instructions to download them into `data/raw/` before running the pipeline. |
+
+**Recommended:** Keep `data/raw/` ignored. Use the download script or the EPA links above to populate `data/raw/` once per machine (or use DVC if you need versioned, shareable data).
+
 ## Run the pipeline
 
 ```bash
+# Optional: download EPA daily CSVs into data/raw/ (otherwise place your 5 CSVs there)
+python scripts/download_raw_data.py
+
 # 1. Clean and compute days above AQI 100 per site per year
 python 01_clean_aqi_days_above_100.py
 
@@ -44,7 +60,7 @@ Outputs:
 
 - **Processed data:** `data/processed/days_above_aqi100_by_site_year.csv`
 - **IDW grids:** `data/idw/idw_2020.csv`, … `idw_2025.csv`
-- **Figures:** `outputs/01_trend_days_above_aqi100_by_year.png`, `outputs/02_map_2020.png`, … `02_map_2023.png`
+- **Figures:** `outputs/01_trend_days_above_aqi100_by_year.png`, `outputs/02_map_2020.png`, … `02_map_2025.png`
 
 ## Scripts (R → Python)
 
@@ -53,10 +69,6 @@ Outputs:
 | `01_us_calculate_days_above_aqi.R` | `01_clean_aqi_days_above_100.py` |
 | `02_aqi_100_idw.R` | `02_aqi_100_idw.py` |
 | — | `03_visualize.py` (five visualizations) |
-
-## Adding 2024 and 2025 to the maps
-
-In `03_visualize.py`, extend the `years_to_plot` tuple in `viz2_to_5_maps()` (e.g. add 2024 and 2025) and run again to generate additional map figures.
 
 ## Create this repo on GitHub
 
