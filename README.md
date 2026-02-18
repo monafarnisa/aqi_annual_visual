@@ -1,6 +1,6 @@
 # aqi_annual_visual
 
-Calculate **days above AQI 100** per year (2020–2025) and produce **five data visualizations**. Pipeline is in **Python** (converted from R scripts used in [wwri/domains](https://github.com/wwri/domains) air quality workflow).
+Calculate **days above AQI 100** per year (2020–2025) and produce **five data visualizations**. Pipeline is in **Python**. 
 
 ## What this repo does
 
