@@ -1,28 +1,35 @@
 """
 02_aqi_100_idw.py
-Regional IDW interpolation (CONUS, AK, HI) from script 1 outputs.
-Writes yearly GeoPackage + CSV grid and static PNG maps.
+Raster-based IDW interpolation for days above AQI 100.
+Consumes script 1 outputs and writes GeoTIFFs + static previews.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import tempfile
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import rasterio
+from rasterio.features import geometry_mask
+from rasterio.transform import from_origin
 from scipy.spatial import cKDTree
-from shapely.geometry import Point, box
+from shapely.geometry import box
+import requests
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 INTERMEDIATE_DIR = DATA_DIR / "processed"
-OUT_DIR = DATA_DIR / "idw"
-FIG_DIR = Path(__file__).resolve().parent / "outputs" / "idw_static"
+OUT_DIR = DATA_DIR / "idw_raster"
+PREVIEW_DIR = Path(__file__).resolve().parent / "outputs" / "idw_raster_static"
 YEARS = list(range(2020, 2026))
 THRESHOLD = 100
+NODATA = -9999.0
 
+# Region CRSs chosen for better distance behavior in IDW.
 REGIONS = {
     "conus": {"stusps": None, "drop": {"AK", "HI", "AS", "GU", "MP", "PR", "VI"}, "crs": 5070},
     "ak": {"stusps": {"AK"}, "drop": None, "crs": 3338},
@@ -37,200 +44,254 @@ FALLBACK_REGION_BOUNDS_WGS84 = {
 }
 
 
+@lru_cache(maxsize=1)
+def load_us_states() -> gpd.GeoDataFrame:
+    """Load US state polygons from Census URL; fallback caller handles failures."""
+    def _to_wgs84(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        if gdf.crs is None:
+            return gdf.set_crs(4326)
+        return gdf.to_crs(4326)
+
+    try:
+        return _to_wgs84(gpd.read_file(CENSUS_STATES_URL))
+    except Exception:
+        # Retry via explicit download when direct read has SSL/cert issues.
+        resp = requests.get(CENSUS_STATES_URL, timeout=120, verify=False)
+        resp.raise_for_status()
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=True) as tmp:
+            tmp.write(resp.content)
+            tmp.flush()
+            return _to_wgs84(gpd.read_file(tmp.name))
+
+
 @lru_cache(maxsize=None)
 def fetch_region_boundary(region_key: str) -> gpd.GeoDataFrame:
     cfg = REGIONS[region_key]
     try:
-        states = gpd.read_file(CENSUS_STATES_URL).set_crs(4326)
+        states = load_us_states()
         if cfg["stusps"] is not None:
             states = states[states["STUSPS"].isin(cfg["stusps"])].copy()
         else:
             states = states[~states["STUSPS"].isin(cfg["drop"])].copy()
         return states.dissolve().reset_index(drop=True)
     except Exception:
+        # Fallback keeps workflow running when remote shapefile fails (SSL/network issues).
         minx, miny, maxx, maxy = FALLBACK_REGION_BOUNDS_WGS84[region_key]
         return gpd.GeoDataFrame(geometry=[box(minx, miny, maxx, maxy)], crs=4326)
 
 
-def make_point_grid_within_polygon(poly_gdf: gpd.GeoDataFrame, spacing_m: float) -> gpd.GeoDataFrame:
-    poly = poly_gdf.geometry.iloc[0]
-    minx, miny, maxx, maxy = poly.bounds
-    xs = np.arange(minx, maxx + spacing_m, spacing_m)
-    ys = np.arange(miny, maxy + spacing_m, spacing_m)
-    pts = [Point(x, y) for x in xs for y in ys]
-    gdf = gpd.GeoDataFrame(geometry=pts, crs=poly_gdf.crs)
-    return gdf[gdf.within(poly)].copy()
+@lru_cache(maxsize=None)
+def fetch_region_states(region_key: str) -> gpd.GeoDataFrame:
+    cfg = REGIONS[region_key]
+    try:
+        states = load_us_states()
+        if cfg["stusps"] is not None:
+            return states[states["STUSPS"].isin(cfg["stusps"])].copy()
+        return states[~states["STUSPS"].isin(cfg["drop"])].copy()
+    except Exception:
+        # Empty fallback when state polygons are unavailable.
+        return gpd.GeoDataFrame(geometry=[], crs=4326)
 
 
-def _idw_predict_all(
-    xy_grid: np.ndarray,
+def idw_to_grid(
     xy_data: np.ndarray,
-    z_data: np.ndarray,
-    idp: float,
-    nmax: int,
+    values: np.ndarray,
+    xgrid: np.ndarray,
+    ygrid: np.ndarray,
+    idp: float = 5.0,
+    nmax: int = 10,
 ) -> np.ndarray:
+    """
+    IDW over a raster grid defined by xgrid (cols) and ygrid (rows).
+    Returns a 2D array shaped (len(ygrid), len(xgrid)).
+    """
+    k = min(max(1, nmax), len(values))
     tree = cKDTree(xy_data)
-    k = min(nmax, len(z_data))
-    dists, idxs = tree.query(xy_grid, k=k, workers=-1)
+
+    X, Y = np.meshgrid(xgrid, ygrid)
+    q = np.column_stack([X.ravel(), Y.ravel()])
+    dists, idxs = tree.query(q, k=k)
+
     if k == 1:
         dists = dists[:, None]
         idxs = idxs[:, None]
 
-    zero_mask = dists == 0
-    out = np.empty(xy_grid.shape[0], dtype=float)
+    out = np.empty(q.shape[0], dtype=float)
+    zero = (dists == 0).any(axis=1)
+    if zero.any():
+        zr = np.where(zero)[0]
+        zc = (dists[zr] == 0).argmax(axis=1)
+        out[zr] = values[idxs[zr, zc]]
 
-    any_zero = zero_mask.any(axis=1)
-    if any_zero.any():
-        hit_rows = np.where(any_zero)[0]
-        hit_cols = zero_mask[hit_rows].argmax(axis=1)
-        out[hit_rows] = z_data[idxs[hit_rows, hit_cols]]
-
-    regular_rows = np.where(~any_zero)[0]
-    if regular_rows.size > 0:
-        d = dists[regular_rows]
-        i = idxs[regular_rows]
+    nr = np.where(~zero)[0]
+    if nr.size:
+        d = dists[nr]
+        i = idxs[nr]
         w = 1.0 / np.power(d, idp)
-        out[regular_rows] = (w * z_data[i]).sum(axis=1) / w.sum(axis=1)
+        out[nr] = (w * values[i]).sum(axis=1) / w.sum(axis=1)
 
-    return out
-
-
-def idw_region(
-    pts_wgs84: gpd.GeoDataFrame,
-    region_key: str,
-    value_col: str,
-    grid_km: float,
-    idp: float,
-    nmax: int,
-) -> gpd.GeoDataFrame:
-    crs = REGIONS[region_key]["crs"]
-    boundary_wgs84 = fetch_region_boundary(region_key)
-    boundary = boundary_wgs84.to_crs(crs)
-    pts = pts_wgs84.to_crs(crs)
-
-    region_poly = boundary.geometry.iloc[0]
-    pts = pts[pts.within(region_poly)].copy()
-    if pts.empty:
-        return gpd.GeoDataFrame(columns=[value_col, "region", "geometry"], geometry="geometry", crs=crs)
-
-    spacing_m = grid_km * 1000.0
-    grid = make_point_grid_within_polygon(boundary, spacing_m=spacing_m)
-
-    xy_data = np.column_stack([pts.geometry.x.values, pts.geometry.y.values])
-    z_data = pts[value_col].values.astype(float)
-    xy_grid = np.column_stack([grid.geometry.x.values, grid.geometry.y.values])
-    preds = _idw_predict_all(xy_grid, xy_data, z_data, idp=idp, nmax=nmax)
-
-    out = grid.copy()
-    out[value_col] = preds
-    out["region"] = region_key
-    return out.set_crs(crs)
+    return out.reshape(len(ygrid), len(xgrid))
 
 
-def run_us_idw_all_regions(
+def make_grid_from_bounds(bounds: tuple[float, float, float, float], res_m: float):
+    """
+    bounds: (minx, miny, maxx, maxy) in projected meters.
+    res_m: pixel size in meters.
+    """
+    minx, miny, maxx, maxy = bounds
+    width = int(np.ceil((maxx - minx) / res_m))
+    height = int(np.ceil((maxy - miny) / res_m))
+
+    xgrid = minx + (np.arange(width) + 0.5) * res_m
+    ygrid = maxy - (np.arange(height) + 0.5) * res_m
+    transform = from_origin(minx, maxy, res_m, res_m)
+    return xgrid, ygrid, transform, width, height
+
+
+def interpolate_days_above_100_to_tifs(
+    df: pd.DataFrame,
     year: int,
-    intermediate_dir: Path,
     out_dir: Path,
-    threshold: int = 100,
-    grid_km_by_region: dict[str, float] | None = None,
+    value_col: str = "days_above_100",
     idp: float = 5.0,
     nmax: int = 10,
-    out_crs_for_animation: int = 4326,
-) -> gpd.GeoDataFrame:
-    if grid_km_by_region is None:
-        grid_km_by_region = {"conus": 50.0, "ak": 80.0, "hi": 20.0}
+    res_km_by_region: dict[str, float] | None = None,
+    nodata: float = NODATA,
+) -> dict[str, Path]:
+    if res_km_by_region is None:
+        res_km_by_region = {"conus": 5.0, "ak": 20.0, "hi": 5.0}
 
-    in_csv = intermediate_dir / f"us_days_above_{threshold}_{year}.csv"
-    if not in_csv.exists():
-        raise FileNotFoundError(f"Missing input from script 1: {in_csv}")
-
-    df = pd.read_csv(in_csv)
-    value_col = f"days_above_{threshold}"
-    needed = {"longitude", "latitude", value_col}
-    missing = needed - set(df.columns)
+    required = {"longitude", "latitude", value_col}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"{in_csv.name} missing columns: {sorted(missing)}")
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    df = df.dropna(subset=["longitude", "latitude", value_col]).copy()
     pts = gpd.GeoDataFrame(
         df[[value_col]].copy(),
         geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
         crs=4326,
     )
 
-    conus = idw_region(pts, "conus", value_col, grid_km_by_region["conus"], idp, nmax)
-    ak = idw_region(pts, "ak", value_col, grid_km_by_region["ak"], idp, nmax)
-    hi = idw_region(pts, "hi", value_col, grid_km_by_region["hi"], idp, nmax)
-
-    conus = conus.to_crs(out_crs_for_animation)
-    ak = ak.to_crs(out_crs_for_animation)
-    hi = hi.to_crs(out_crs_for_animation)
-
-    combined = gpd.GeoDataFrame(
-        pd.concat([conus, ak, hi], ignore_index=True),
-        geometry="geometry",
-        crs=out_crs_for_animation,
-    )
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_gpkg = out_dir / f"us_idw_days_above_{threshold}_{year}_all_regions_epsg{out_crs_for_animation}.gpkg"
-    combined.to_file(out_gpkg, layer="idw", driver="GPKG")
+    outputs: dict[str, Path] = {}
 
-    combined_xy = combined.copy()
-    combined_xy["lon"] = combined_xy.geometry.x
-    combined_xy["lat"] = combined_xy.geometry.y
-    out_csv = out_dir / f"idw_{year}.csv"
-    combined_xy[["lon", "lat", value_col, "region"]].to_csv(out_csv, index=False)
+    for region_key, cfg in REGIONS.items():
+        crs = cfg["crs"]
+        res_m = res_km_by_region[region_key] * 1000.0
+        boundary = fetch_region_boundary(region_key).to_crs(crs)
+        region_poly = boundary.geometry.iloc[0]
 
-    print(f"Saved {out_gpkg}")
-    print(f"Saved {out_csv}")
-    return combined
+        pts_r = pts.to_crs(crs)
+        pts_r = pts_r[pts_r.within(region_poly)].copy()
+        if pts_r.empty:
+            print(f"{year} {region_key}: no points in region, skipping.")
+            continue
 
-
-def save_static_map(gdf_wgs84: gpd.GeoDataFrame, year: int, threshold: int = 100) -> Path:
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
-    value_col = f"days_above_{threshold}"
-    fig, ax = plt.subplots(figsize=(11, 7))
-
-    boundaries = [fetch_region_boundary("conus"), fetch_region_boundary("ak"), fetch_region_boundary("hi")]
-    for b in boundaries:
-        b.boundary.plot(ax=ax, color="black", linewidth=0.6)
-
-    if not gdf_wgs84.empty:
-        gdf_wgs84.plot(
-            ax=ax,
-            column=value_col,
-            cmap="YlOrRd",
-            markersize=4,
-            legend=True,
-            legend_kwds={"label": f"Days above AQI {threshold}"},
+        bounds = boundary.total_bounds
+        xgrid, ygrid, transform, width, height = make_grid_from_bounds(
+            (bounds[0], bounds[1], bounds[2], bounds[3]),
+            res_m=res_m,
         )
 
-    ax.set_title(f"IDW Surface of Days Above AQI {threshold} ({year})")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    ax.set_xlim(-179, -65)
-    ax.set_ylim(17, 73)
-    ax.grid(alpha=0.2)
-    fig.tight_layout()
+        xy = np.column_stack([pts_r.geometry.x.values, pts_r.geometry.y.values])
+        vals = pts_r[value_col].values.astype(float)
+        z = idw_to_grid(xy, vals, xgrid, ygrid, idp=idp, nmax=nmax)
 
-    out_png = FIG_DIR / f"idw_static_{year}.png"
+        mask = geometry_mask(
+            geometries=boundary.geometry,
+            out_shape=(height, width),
+            transform=transform,
+            invert=True,
+        )
+        z_masked = np.where(mask, z, nodata).astype(np.float32)
+
+        out_path = out_dir / f"days_above_100_idw_{region_key}_{year}_res{int(res_m)}m.tif"
+        with rasterio.open(
+            out_path,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=1,
+            dtype="float32",
+            crs=f"EPSG:{crs}",
+            transform=transform,
+            nodata=nodata,
+            compress="deflate",
+        ) as dst:
+            dst.write(z_masked, 1)
+
+        outputs[region_key] = out_path
+        print(f"Saved {out_path}")
+
+    return outputs
+
+
+def save_tif_preview(tif_path: Path, preview_dir: Path) -> Path:
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    region_key = next((k for k in REGIONS if f"_{k}_" in tif_path.name), "conus")
+    with rasterio.open(tif_path) as src:
+        arr = src.read(1)
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, np.nan, arr)
+        bounds = src.bounds
+        tif_crs = src.crs
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(
+        arr,
+        cmap="viridis",
+        interpolation="nearest",
+        origin="upper",
+        extent=[bounds.left, bounds.right, bounds.bottom, bounds.top],
+        vmin=0,
+    )
+    fig.colorbar(im, ax=ax, label="Days above AQI 100")
+
+    region_boundary = fetch_region_boundary(region_key)
+    if not region_boundary.empty:
+        region_boundary.to_crs(tif_crs).boundary.plot(ax=ax, color="black", linewidth=1.0)
+
+    states = fetch_region_states(region_key)
+    if not states.empty:
+        states.to_crs(tif_crs).boundary.plot(ax=ax, color="white", linewidth=0.35, alpha=0.6)
+
+    ax.set_title(tif_path.stem)
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+    fig.tight_layout()
+    out_png = preview_dir / f"{tif_path.stem}.png"
     fig.savefig(out_png, dpi=180)
     plt.close(fig)
     print(f"Saved {out_png}")
     return out_png
 
 
+def run_year(year: int) -> dict[str, Path]:
+    in_csv = INTERMEDIATE_DIR / f"us_days_above_{THRESHOLD}_{year}.csv"
+    if not in_csv.exists():
+        raise FileNotFoundError(f"Missing input from script 1: {in_csv}")
+
+    df = pd.read_csv(in_csv).dropna(subset=["longitude", "latitude", f"days_above_{THRESHOLD}"])
+    outputs = interpolate_days_above_100_to_tifs(
+        df=df,
+        year=year,
+        out_dir=OUT_DIR,
+        value_col=f"days_above_{THRESHOLD}",
+        idp=5.0,
+        nmax=10,
+    )
+    for tif in outputs.values():
+        save_tif_preview(tif, PREVIEW_DIR)
+    return outputs
+
+
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     for year in YEARS:
-        result = run_us_idw_all_regions(
-            year=year,
-            intermediate_dir=INTERMEDIATE_DIR,
-            out_dir=OUT_DIR,
-            threshold=THRESHOLD,
-        )
-        save_static_map(result, year=year, threshold=THRESHOLD)
+        run_year(year)
 
 
 if __name__ == "__main__":
