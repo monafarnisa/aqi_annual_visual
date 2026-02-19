@@ -1,116 +1,127 @@
 """
 03_visualize.py
-Five data visualizations: days above AQI 100 by year (2020-2025).
-1. Trend: mean days above AQI 100 per year (bar or line).
-2–7. One map per year (2020–2025): IDW surface of days above AQI 100.
+Interactive Leaflet visualization with county borders and year layers.
 """
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+import tempfile
 from pathlib import Path
 
-# Optional: basemap tiles (install contextily for web tiles)
-try:
-    import contextily as ctx
-    HAS_CTX = True
-except ImportError:
-    HAS_CTX = False
+import branca.colormap as bcm
+import folium
+import geopandas as gpd
+import pandas as pd
+import requests
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 PROCESSED_DIR = DATA_DIR / "processed"
-IDW_DIR = DATA_DIR / "idw"
-OUT_DIR = Path(__file__).resolve().parent / "outputs"
+OUT_DIR = Path(__file__).resolve().parent / "outputs" / "leaflet"
 YEARS = list(range(2020, 2026))
-MAX_PIVOT_CELLS = 4_000_000
-USE_BASEMAP = False
+COUNTIES_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_5m.zip"
+STATES_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_state_5m.zip"
+DROP_STUSPS = {"AS", "GU", "MP", "PR", "VI"}
 
 
-def load_data():
-    """Load processed site-year table and optional IDW grids."""
-    path = PROCESSED_DIR / "days_above_aqi100_by_site_year.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Run 01_clean_aqi_days_above_100.py first. Missing {path}")
-    df = pd.read_csv(path)
-    return df
+def _load_shapefile_url(url: str) -> gpd.GeoDataFrame:
+    try:
+        gdf = gpd.read_file(url)
+    except Exception:
+        resp = requests.get(url, timeout=120, verify=False)
+        resp.raise_for_status()
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=True) as tmp:
+            tmp.write(resp.content)
+            tmp.flush()
+            gdf = gpd.read_file(tmp.name)
+    if gdf.crs is None:
+        return gdf.set_crs(4326)
+    return gdf.to_crs(4326)
 
 
-def viz1_trend_by_year(df: pd.DataFrame):
-    """Visualization 1: Mean (or total) days above AQI 100 per year."""
+def load_processed_county_values() -> pd.DataFrame:
+    in_csv = PROCESSED_DIR / "days_above_aqi100_by_site_year.csv"
+    if not in_csv.exists():
+        raise FileNotFoundError(f"Missing processed file: {in_csv}")
+
+    df = pd.read_csv(in_csv)
+    for col, width in (("state_code", 2), ("county_code", 3)):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).astype(str).str.zfill(width)
+    df["GEOID"] = df["state_code"] + df["county_code"]
+
+    # County-level summary for mapping.
+    county_year = (
+        df.groupby(["Year", "GEOID"], as_index=False)["days_above_100"]
+        .mean()
+        .rename(columns={"days_above_100": "days_above_100_mean"})
+    )
+    return county_year
+
+
+def build_leaflet_map() -> Path:
+    counties = _load_shapefile_url(COUNTIES_URL)
+    states = _load_shapefile_url(STATES_URL)
+    states = states[~states["STUSPS"].isin(DROP_STUSPS)].copy()
+    counties = counties[counties["STATEFP"].isin(states["STATEFP"])].copy()
+
+    county_year = load_processed_county_values()
+    max_val = float(county_year["days_above_100_mean"].max()) if not county_year.empty else 1.0
+    cmap = bcm.linear.YlOrRd_09.scale(0, max_val)
+    cmap.caption = "Mean days above AQI 100 (county)"
+
+    m = folium.Map(location=[39.5, -98.35], zoom_start=4, tiles="CartoDB positron")
+
+    for year in YEARS:
+        vals = county_year[county_year["Year"] == year][["GEOID", "days_above_100_mean"]]
+        joined = counties.merge(vals, how="left", left_on="GEOID", right_on="GEOID")
+
+        fg = folium.FeatureGroup(name=f"{year}", show=(year == YEARS[-1]))
+
+        def style_fn(feature):
+            v = feature["properties"].get("days_above_100_mean")
+            color = "#f2f2f2" if v is None else cmap(v)
+            return {
+                "fillColor": color,
+                "fillOpacity": 0.75,
+                "color": "#8c8c8c",
+                "weight": 0.35,  # county borders
+            }
+
+        tooltip = folium.GeoJsonTooltip(
+            fields=["NAME", "STATE_NAME", "days_above_100_mean"],
+            aliases=["County", "State", "Days > 100 (mean)"],
+            localize=True,
+            sticky=False,
+            labels=True,
+        )
+
+        folium.GeoJson(
+            data=joined.to_json(),
+            style_function=style_fn,
+            tooltip=tooltip,
+            name=f"Counties {year}",
+        ).add_to(fg)
+
+        fg.add_to(m)
+
+    # State borders as a crisp overlay.
+    folium.GeoJson(
+        data=states.to_json(),
+        name="State borders",
+        style_function=lambda _: {"color": "#222222", "weight": 1.1, "fillOpacity": 0.0},
+    ).add_to(m)
+
+    cmap.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    by_year = df.groupby("Year")["days_above_100"].agg(["mean", "sum", "count"]).reset_index()
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.bar(by_year["Year"], by_year["mean"], color="steelblue", edgecolor="navy", alpha=0.85)
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Mean days above AQI 100 (per site)")
-    ax.set_title("Days Above AQI 100 by Year (2020–2025)")
-    ax.set_xticks(YEARS)
-    fig.tight_layout()
-    fig.savefig(OUT_DIR / "01_trend_days_above_aqi100_by_year.png", dpi=150)
-    plt.close()
-    print(f"Saved {OUT_DIR / '01_trend_days_above_aqi100_by_year.png'}")
+    out_html = OUT_DIR / "aqi_days_above_100_county_leaflet.html"
+    m.save(str(out_html))
+    print(f"Saved {out_html}")
+    return out_html
 
 
-def viz2_to_5_maps(df: pd.DataFrame, years_to_plot=(2020, 2021, 2022, 2023, 2024, 2025)):
-    """Visualizations 2–7: One map per year (2020–2025) using IDW grid if available, else points."""
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    for year in years_to_plot:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        idw_path = IDW_DIR / f"idw_{year}.csv"
-        if idw_path.exists():
-            grid_df = pd.read_csv(idw_path)
-            lon_vals = np.sort(grid_df["lon"].unique())
-            lat_vals = np.sort(grid_df["lat"].unique())
-            n_cells = len(lon_vals) * len(lat_vals)
-            is_dense_grid = n_cells == len(grid_df)
-            if len(lon_vals) > 1 and len(lat_vals) > 1 and is_dense_grid and n_cells <= MAX_PIVOT_CELLS:
-                pivot = grid_df.pivot(index="lat", columns="lon", values="days_above_100")
-                pivot = pivot.reindex(index=lat_vals, columns=lon_vals)
-                Z = pivot.values
-                im = ax.pcolormesh(lon_vals, lat_vals, Z, cmap="YlOrRd", shading="auto", vmin=0)
-                plt.colorbar(im, ax=ax, label="Days above AQI 100")
-            else:
-                # Fallback for irregular point grids (e.g. projected grid reprojected to EPSG:4326)
-                sc = ax.scatter(
-                    grid_df["lon"],
-                    grid_df["lat"],
-                    c=grid_df["days_above_100"],
-                    cmap="YlOrRd",
-                    s=2,
-                    linewidths=0,
-                )
-                plt.colorbar(sc, ax=ax, label="Days above AQI 100")
-        else:
-            sub = df[df["Year"] == year].dropna(subset=["Longitude", "Latitude"])
-            if sub.empty:
-                ax.set_title(f"{year}: No data")
-                fig.savefig(OUT_DIR / f"02_map_{year}.png", dpi=150)
-                plt.close()
-                continue
-            sc = ax.scatter(sub["Longitude"], sub["Latitude"], c=sub["days_above_100"], cmap="YlOrRd", s=15, alpha=0.8)
-            plt.colorbar(sc, ax=ax, label="Days above AQI 100")
-        ax.set_xlim(-179, -65)
-        ax.set_ylim(17, 73)
-        ax.set_xlabel("Longitude")
-        ax.set_ylabel("Latitude")
-        ax.set_title(f"Days Above AQI 100 — {year}")
-        if HAS_CTX and USE_BASEMAP:
-            try:
-                ctx.add_basemap(ax, crs="EPSG:4326", source=ctx.providers.CartoDB.Positron, zoom=4)
-            except Exception:
-                pass
-        fig.tight_layout()
-        fig.savefig(OUT_DIR / f"02_map_{year}.png", dpi=150)
-        plt.close()
-        print(f"Saved {OUT_DIR / f'02_map_{year}.png'}")
-
-
-def main():
-    df = load_data()
-    viz1_trend_by_year(df)
-    # 1 trend + one map per year (2020–2025)
-    viz2_to_5_maps(df, years_to_plot=(2020, 2021, 2022, 2023, 2024, 2025))
-    print("Done. Check the 'outputs' folder.")
+def main() -> None:
+    build_leaflet_map()
 
 
 if __name__ == "__main__":

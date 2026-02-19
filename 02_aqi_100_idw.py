@@ -25,6 +25,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 INTERMEDIATE_DIR = DATA_DIR / "processed"
 OUT_DIR = DATA_DIR / "idw_raster"
 PREVIEW_DIR = Path(__file__).resolve().parent / "outputs" / "idw_raster_static"
+INSET_DIR = Path(__file__).resolve().parent / "outputs" / "idw_raster_inset"
 YEARS = list(range(2020, 2026))
 THRESHOLD = 100
 NODATA = -9999.0
@@ -241,7 +242,7 @@ def save_tif_preview(tif_path: Path, preview_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(8, 8))
     im = ax.imshow(
         arr,
-        cmap="viridis",
+        cmap="YlOrRd",
         interpolation="nearest",
         origin="upper",
         extent=[bounds.left, bounds.right, bounds.bottom, bounds.top],
@@ -268,6 +269,65 @@ def save_tif_preview(tif_path: Path, preview_dir: Path) -> Path:
     return out_png
 
 
+def _read_tif_array(tif_path: Path):
+    with rasterio.open(tif_path) as src:
+        arr = src.read(1)
+        nodata = src.nodata
+        if nodata is not None:
+            arr = np.where(arr == nodata, np.nan, arr)
+        return arr, src.bounds, src.crs
+
+
+def save_inset_map(year: int, tif_paths: dict[str, Path], out_dir: Path) -> Path | None:
+    if not all(k in tif_paths for k in ("conus", "ak", "hi")):
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(14, 9))
+    ax_main = fig.add_axes([0.03, 0.06, 0.78, 0.88])
+    ax_ak = fig.add_axes([0.72, 0.58, 0.25, 0.30])
+    ax_hi = fig.add_axes([0.76, 0.24, 0.18, 0.20])
+
+    def plot_region(ax, region_key: str):
+        arr, bounds, tif_crs = _read_tif_array(tif_paths[region_key])
+        im = ax.imshow(
+            arr,
+            cmap="YlOrRd",
+            interpolation="nearest",
+            origin="upper",
+            extent=[bounds.left, bounds.right, bounds.bottom, bounds.top],
+            vmin=0,
+        )
+        region_boundary = fetch_region_boundary(region_key)
+        if not region_boundary.empty:
+            region_boundary.to_crs(tif_crs).boundary.plot(ax=ax, color="black", linewidth=1.1)
+
+        states = fetch_region_states(region_key)
+        if not states.empty:
+            states.to_crs(tif_crs).boundary.plot(ax=ax, color="white", linewidth=0.35, alpha=0.65)
+        ax.set_axis_off()
+        ax.set_aspect("equal")
+        return im
+
+    im = plot_region(ax_main, "conus")
+    plot_region(ax_ak, "ak")
+    plot_region(ax_hi, "hi")
+
+    ax_main.set_title(f"AQI days > 100 ({year})", loc="left", fontsize=22, fontweight="bold")
+    ax_main.text(0.0, 0.98, f"{year}; raster IDW", transform=ax_main.transAxes, fontsize=14, va="top")
+    ax_ak.set_title("AK", fontsize=11)
+    ax_hi.set_title("HI", fontsize=11)
+
+    cax = fig.add_axes([0.86, 0.18, 0.02, 0.55])
+    fig.colorbar(im, cax=cax, label="Days above AQI 100")
+
+    out_png = out_dir / f"us_days_above_100_inset_{year}.png"
+    fig.savefig(out_png, dpi=190)
+    plt.close(fig)
+    print(f"Saved {out_png}")
+    return out_png
+
+
 def run_year(year: int) -> dict[str, Path]:
     in_csv = INTERMEDIATE_DIR / f"us_days_above_{THRESHOLD}_{year}.csv"
     if not in_csv.exists():
@@ -284,12 +344,14 @@ def run_year(year: int) -> dict[str, Path]:
     )
     for tif in outputs.values():
         save_tif_preview(tif, PREVIEW_DIR)
+    save_inset_map(year, outputs, INSET_DIR)
     return outputs
 
 
 def main() -> None:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    INSET_DIR.mkdir(parents=True, exist_ok=True)
     for year in YEARS:
         run_year(year)
 
