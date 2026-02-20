@@ -242,7 +242,7 @@ def save_tif_preview(tif_path: Path, preview_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(8, 8))
     im = ax.imshow(
         arr,
-        cmap="YlOrRd",
+        cmap="afmhot",
         interpolation="nearest",
         origin="upper",
         extent=[bounds.left, bounds.right, bounds.bottom, bounds.top],
@@ -256,7 +256,7 @@ def save_tif_preview(tif_path: Path, preview_dir: Path) -> Path:
 
     states = fetch_region_states(region_key)
     if not states.empty:
-        states.to_crs(tif_crs).boundary.plot(ax=ax, color="white", linewidth=0.35, alpha=0.6)
+        states.to_crs(tif_crs).boundary.plot(ax=ax, color="black", linewidth=0.45, alpha=0.8)
 
     ax.set_title(tif_path.stem)
     ax.set_aspect("equal")
@@ -278,25 +278,34 @@ def _read_tif_array(tif_path: Path):
         return arr, src.bounds, src.crs
 
 
-def save_inset_map(year: int, tif_paths: dict[str, Path], out_dir: Path) -> Path | None:
+def save_inset_map(
+    year: int,
+    tif_paths: dict[str, Path],
+    out_dir: Path,
+    cmap_name: str = "afmhot",
+    file_suffix: str = "",
+    vmax: float | None = None,
+) -> Path | None:
     if not all(k in tif_paths for k in ("conus", "ak", "hi")):
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     fig = plt.figure(figsize=(14, 9))
-    ax_main = fig.add_axes([0.03, 0.06, 0.78, 0.88])
-    ax_ak = fig.add_axes([0.72, 0.58, 0.25, 0.30])
-    ax_hi = fig.add_axes([0.76, 0.24, 0.18, 0.20])
+    ax_main = fig.add_axes([0.22, 0.05, 0.70, 0.90])
+    # Place AK and HI in bottom-left corner to avoid CONUS overlap.
+    ax_ak = fig.add_axes([0.02, 0.22, 0.24, 0.28])
+    ax_hi = fig.add_axes([0.05, 0.05, 0.18, 0.14])
 
     def plot_region(ax, region_key: str):
         arr, bounds, tif_crs = _read_tif_array(tif_paths[region_key])
         im = ax.imshow(
             arr,
-            cmap="YlOrRd",
+            cmap=cmap_name,
             interpolation="nearest",
             origin="upper",
             extent=[bounds.left, bounds.right, bounds.bottom, bounds.top],
             vmin=0,
+            vmax=vmax,
         )
         region_boundary = fetch_region_boundary(region_key)
         if not region_boundary.empty:
@@ -304,7 +313,7 @@ def save_inset_map(year: int, tif_paths: dict[str, Path], out_dir: Path) -> Path
 
         states = fetch_region_states(region_key)
         if not states.empty:
-            states.to_crs(tif_crs).boundary.plot(ax=ax, color="white", linewidth=0.35, alpha=0.65)
+            states.to_crs(tif_crs).boundary.plot(ax=ax, color="white", linewidth=0.55, alpha=0.95)
         ax.set_axis_off()
         ax.set_aspect("equal")
         return im
@@ -313,19 +322,30 @@ def save_inset_map(year: int, tif_paths: dict[str, Path], out_dir: Path) -> Path
     plot_region(ax_ak, "ak")
     plot_region(ax_hi, "hi")
 
-    ax_main.set_title(f"AQI days > 100 ({year})", loc="left", fontsize=22, fontweight="bold")
-    ax_main.text(0.0, 0.98, f"{year}; raster IDW", transform=ax_main.transAxes, fontsize=14, va="top")
+    ax_main.set_title(f"Days of AQI > 100 in {year}", loc="center", fontsize=22, fontweight="bold")
     ax_ak.set_title("AK", fontsize=11)
     ax_hi.set_title("HI", fontsize=11)
 
-    cax = fig.add_axes([0.86, 0.18, 0.02, 0.55])
+    cax = fig.add_axes([0.92, 0.18, 0.02, 0.55])
     fig.colorbar(im, cax=cax, label="Days above AQI 100")
 
-    out_png = out_dir / f"us_days_above_100_inset_{year}.png"
+    suffix = f"_{file_suffix}" if file_suffix else ""
+    out_png = out_dir / f"us_days_above_100_inset_{year}{suffix}.png"
     fig.savefig(out_png, dpi=190)
     plt.close(fig)
     print(f"Saved {out_png}")
     return out_png
+
+
+def global_tif_max(paths: list[Path]) -> float:
+    max_val = 0.0
+    for path in paths:
+        if not path.exists():
+            continue
+        arr, _, _ = _read_tif_array(path)
+        if np.isfinite(arr).any():
+            max_val = max(max_val, float(np.nanmax(arr)))
+    return max_val
 
 
 def run_year(year: int) -> dict[str, Path]:

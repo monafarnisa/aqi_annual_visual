@@ -1,6 +1,7 @@
 """
 03_visualize.py
 Interactive Leaflet visualization with county borders and year layers.
+Uses IDW interpolation rasters from script 2 as interactive layers.
 """
 
 from __future__ import annotations
@@ -11,16 +12,22 @@ from pathlib import Path
 import branca.colormap as bcm
 import folium
 import geopandas as gpd
-import pandas as pd
+import matplotlib
+import matplotlib.colors as mcolors
+import numpy as np
+import rasterio
+from rasterio.transform import array_bounds
+from rasterio.warp import Resampling, calculate_default_transform, reproject
 import requests
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-PROCESSED_DIR = DATA_DIR / "processed"
+IDW_RASTER_DIR = DATA_DIR / "idw_raster"
 OUT_DIR = Path(__file__).resolve().parent / "outputs" / "leaflet"
 YEARS = list(range(2020, 2026))
 COUNTIES_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_5m.zip"
 STATES_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_state_5m.zip"
 DROP_STUSPS = {"AS", "GU", "MP", "PR", "VI"}
+NODATA = -9999.0
 
 
 def _load_shapefile_url(url: str) -> gpd.GeoDataFrame:
@@ -38,23 +45,69 @@ def _load_shapefile_url(url: str) -> gpd.GeoDataFrame:
     return gdf.to_crs(4326)
 
 
-def load_processed_county_values() -> pd.DataFrame:
-    in_csv = PROCESSED_DIR / "days_above_aqi100_by_site_year.csv"
-    if not in_csv.exists():
-        raise FileNotFoundError(f"Missing processed file: {in_csv}")
+def _tif_paths_for_year(year: int) -> dict[str, Path]:
+    return {
+        "conus": IDW_RASTER_DIR / f"days_above_100_idw_conus_{year}_res5000m.tif",
+        "ak": IDW_RASTER_DIR / f"days_above_100_idw_ak_{year}_res20000m.tif",
+        "hi": IDW_RASTER_DIR / f"days_above_100_idw_hi_{year}_res5000m.tif",
+    }
 
-    df = pd.read_csv(in_csv)
-    for col, width in (("state_code", 2), ("county_code", 3)):
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int).astype(str).str.zfill(width)
-    df["GEOID"] = df["state_code"] + df["county_code"]
 
-    # County-level summary for mapping.
-    county_year = (
-        df.groupby(["Year", "GEOID"], as_index=False)["days_above_100"]
-        .mean()
-        .rename(columns={"days_above_100": "days_above_100_mean"})
-    )
-    return county_year
+def afmhot_colormap(vmin: float, vmax: float) -> bcm.LinearColormap:
+    """Approximate matplotlib afmhot for Leaflet color rendering."""
+    cmap = matplotlib.colormaps["afmhot"]
+    stops = [mcolors.to_hex(cmap(i)) for i in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]]
+    return bcm.LinearColormap(colors=stops, vmin=vmin, vmax=vmax)
+
+
+def _global_raster_max() -> float:
+    max_val = 0.0
+    for year in YEARS:
+        for path in _tif_paths_for_year(year).values():
+            if not path.exists():
+                continue
+            with rasterio.open(path) as src:
+                arr = src.read(1).astype(float)
+                nodata = src.nodata if src.nodata is not None else NODATA
+                arr[arr == nodata] = np.nan
+                if np.isfinite(arr).any():
+                    max_val = max(max_val, float(np.nanmax(arr)))
+    return max_val if max_val > 0 else 1.0
+
+
+def _reproject_to_wgs84(tif_path: Path) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    with rasterio.open(tif_path) as src:
+        src_arr = src.read(1).astype(np.float32)
+        src_nodata = src.nodata if src.nodata is not None else NODATA
+        src_arr[src_arr == src_nodata] = np.nan
+
+        dst_transform, dst_width, dst_height = calculate_default_transform(
+            src.crs, "EPSG:4326", src.width, src.height, *src.bounds
+        )
+        dst_arr = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
+
+        reproject(
+            source=src_arr,
+            destination=dst_arr,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=np.nan,
+            dst_transform=dst_transform,
+            dst_crs="EPSG:4326",
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+
+    west, south, east, north = array_bounds(dst_height, dst_width, dst_transform)
+    return dst_arr, (south, west, north, east)
+
+
+def _rgba_for_leaflet(arr: np.ndarray, vmax: float) -> np.ndarray:
+    cmap = matplotlib.colormaps["afmhot"]
+    norm = mcolors.Normalize(vmin=0, vmax=vmax, clip=True)
+    rgba = (cmap(norm(np.nan_to_num(arr, nan=0.0))) * 255).astype(np.uint8)
+    rgba[np.isnan(arr), 3] = 0
+    return rgba
 
 
 def build_leaflet_map() -> Path:
@@ -63,43 +116,33 @@ def build_leaflet_map() -> Path:
     states = states[~states["STUSPS"].isin(DROP_STUSPS)].copy()
     counties = counties[counties["STATEFP"].isin(states["STATEFP"])].copy()
 
-    county_year = load_processed_county_values()
-    max_val = float(county_year["days_above_100_mean"].max()) if not county_year.empty else 1.0
-    cmap = bcm.linear.YlOrRd_09.scale(0, max_val)
-    cmap.caption = "Mean days above AQI 100 (county)"
+    max_val = _global_raster_max()
+    cmap = afmhot_colormap(0, max_val)
+    cmap.caption = "Days above AQI 100 (IDW interpolation)"
 
     m = folium.Map(location=[39.5, -98.35], zoom_start=4, tiles="CartoDB positron")
 
+    # County borders as context layer.
+    folium.GeoJson(
+        data=counties.to_json(),
+        name="County borders",
+        style_function=lambda _: {"color": "#666666", "weight": 0.35, "fillOpacity": 0.0},
+    ).add_to(m)
+
     for year in YEARS:
-        vals = county_year[county_year["Year"] == year][["GEOID", "days_above_100_mean"]]
-        joined = counties.merge(vals, how="left", left_on="GEOID", right_on="GEOID")
-
         fg = folium.FeatureGroup(name=f"{year}", show=(year == YEARS[-1]))
-
-        def style_fn(feature):
-            v = feature["properties"].get("days_above_100_mean")
-            color = "#f2f2f2" if v is None else cmap(v)
-            return {
-                "fillColor": color,
-                "fillOpacity": 0.75,
-                "color": "#8c8c8c",
-                "weight": 0.35,  # county borders
-            }
-
-        tooltip = folium.GeoJsonTooltip(
-            fields=["NAME", "STATE_NAME", "days_above_100_mean"],
-            aliases=["County", "State", "Days > 100 (mean)"],
-            localize=True,
-            sticky=False,
-            labels=True,
-        )
-
-        folium.GeoJson(
-            data=joined.to_json(),
-            style_function=style_fn,
-            tooltip=tooltip,
-            name=f"Counties {year}",
-        ).add_to(fg)
+        for region, tif_path in _tif_paths_for_year(year).items():
+            if not tif_path.exists():
+                continue
+            arr, (south, west, north, east) = _reproject_to_wgs84(tif_path)
+            rgba = _rgba_for_leaflet(arr, vmax=max_val)
+            folium.raster_layers.ImageOverlay(
+                image=rgba,
+                bounds=[[south, west], [north, east]],
+                opacity=0.75,
+                interactive=False,
+                name=f"{region} {year}",
+            ).add_to(fg)
 
         fg.add_to(m)
 
