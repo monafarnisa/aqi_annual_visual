@@ -1,6 +1,6 @@
 # aqi_annual_visual
 
-Calculate **days above AQI 100** per year (2020–2025) and produce **five data visualizations**. Pipeline is in **Python**. 
+Script to interpolate **days above AQI 100** per year (2020–2025) from sesnsor locations across the United States and produce **five data visualizations**. Pipeline is in **Python**. 
 
 ## What this repo does
 
@@ -21,11 +21,8 @@ pip install -r requirements.txt
 
 ## Data
 
-- **EPA AirData** daily files: [Download Daily Data](https://www.epa.gov/outdoor-air-quality-data/download-daily-data) or [AirData download files](https://aqs.epa.gov/aqsweb/airdata/download_files.html).
+- **EPA AirData** daily files: [Download Daily AQI Data by County](https://aqs.epa.gov/aqsweb/airdata/daily_aqi_by_county_2025.zip) for each year from 2020 - 2025.
 - Place CSVs in `data/raw/` with names like:
-  - `daily_44201_2020.csv` (PM2.5), `daily_44201_2021.csv`, … for each year, and/or
-  - `daily_42401_YYYY.csv` for ozone.
-- If no files are present, the cleaning script generates **synthetic example data** so you can run the full pipeline and see the visualizations.
 
 ### Including your 5 CSV files (~25 MB each)
 
