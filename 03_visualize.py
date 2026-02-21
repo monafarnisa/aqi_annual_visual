@@ -11,23 +11,23 @@ from pathlib import Path
 
 import branca.colormap as bcm
 import folium
+from branca.element import Element
 import geopandas as gpd
 import matplotlib
 import matplotlib.colors as mcolors
 import numpy as np
-import rasterio
-from rasterio.transform import array_bounds
-from rasterio.warp import Resampling, calculate_default_transform, reproject
+import pandas as pd
 import requests
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
-IDW_RASTER_DIR = DATA_DIR / "idw_raster"
+PROCESSED_DIR = DATA_DIR / "processed"
+RAW_DIR = DATA_DIR / "raw"
 OUT_DIR = Path(__file__).resolve().parent / "outputs" / "leaflet"
 YEARS = list(range(2020, 2026))
 COUNTIES_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_county_5m.zip"
 STATES_URL = "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_state_5m.zip"
 DROP_STUSPS = {"AS", "GU", "MP", "PR", "VI"}
-NODATA = -9999.0
+LEAFLET_CMAP_NAME = "turbo"
 
 
 def _load_shapefile_url(url: str) -> gpd.GeoDataFrame:
@@ -45,69 +45,85 @@ def _load_shapefile_url(url: str) -> gpd.GeoDataFrame:
     return gdf.to_crs(4326)
 
 
-def _tif_paths_for_year(year: int) -> dict[str, Path]:
-    return {
-        "conus": IDW_RASTER_DIR / f"days_above_100_idw_conus_{year}_res5000m.tif",
-        "ak": IDW_RASTER_DIR / f"days_above_100_idw_ak_{year}_res20000m.tif",
-        "hi": IDW_RASTER_DIR / f"days_above_100_idw_hi_{year}_res5000m.tif",
-    }
-
-
-def afmhot_colormap(vmin: float, vmax: float) -> bcm.LinearColormap:
-    """Approximate matplotlib afmhot for Leaflet color rendering."""
-    cmap = matplotlib.colormaps["afmhot"]
+def leaflet_colormap(vmin: float, vmax: float, cmap_name: str = LEAFLET_CMAP_NAME) -> bcm.LinearColormap:
+    """Build a Leaflet legend from a matplotlib colormap."""
+    cmap = matplotlib.colormaps[cmap_name]
     stops = [mcolors.to_hex(cmap(i)) for i in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]]
     return bcm.LinearColormap(colors=stops, vmin=vmin, vmax=vmax)
 
 
-def _global_raster_max() -> float:
+def _year_csv_path(year: int) -> Path:
+    return PROCESSED_DIR / f"us_days_above_100_{year}.csv"
+
+
+def _load_county_year_values(year: int) -> dict[str, float]:
+    path = _year_csv_path(year)
+    if not path.exists():
+        return {}
+
+    df = pd.read_csv(path)
+    needed = {"state_code", "county_code", "days_above_100"}
+    if not needed.issubset(df.columns):
+        return {}
+
+    county = (
+        df.groupby(["state_code", "county_code"], as_index=False)["days_above_100"]
+        .max()
+        .rename(columns={"days_above_100": "county_days_above_100"})
+    )
+    county["GEOID"] = (
+        county["state_code"].astype("Int64").astype(str).str.zfill(2)
+        + county["county_code"].astype("Int64").astype(str).str.zfill(3)
+    )
+    return dict(zip(county["GEOID"], county["county_days_above_100"].astype(float)))
+
+
+def _global_county_max() -> float:
     max_val = 0.0
     for year in YEARS:
-        for path in _tif_paths_for_year(year).values():
-            if not path.exists():
-                continue
-            with rasterio.open(path) as src:
-                arr = src.read(1).astype(float)
-                nodata = src.nodata if src.nodata is not None else NODATA
-                arr[arr == nodata] = np.nan
-                if np.isfinite(arr).any():
-                    max_val = max(max_val, float(np.nanmax(arr)))
+        values = _load_county_year_values(year)
+        if values:
+            max_val = max(max_val, max(values.values()))
     return max_val if max_val > 0 else 1.0
 
 
-def _reproject_to_wgs84(tif_path: Path) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    with rasterio.open(tif_path) as src:
-        src_arr = src.read(1).astype(np.float32)
-        src_nodata = src.nodata if src.nodata is not None else NODATA
-        src_arr[src_arr == src_nodata] = np.nan
+def _style_fn_factory(
+    year_cols: list[str],
+    cmap: bcm.LinearColormap,
+) -> callable:
+    def style_fn(feature: dict) -> dict:
+        props = feature["properties"]
+        vals = [props.get(col) for col in year_cols]
+        has_data = any(v is not None for v in vals)
+        total = float(sum(v for v in vals if v is not None)) if has_data else 0.0
+        if (not has_data) or total <= 0:
+            return {
+                "fillColor": "#d9d9d9",
+                "fillOpacity": 0.20,
+                "color": "#666666",
+                "weight": 0.25,
+            }
+        return {
+            "fillColor": cmap(total),
+            "fillOpacity": 0.78,
+            "color": "#4a4a4a",
+            "weight": 0.25,
+        }
 
-        dst_transform, dst_width, dst_height = calculate_default_transform(
-            src.crs, "EPSG:4326", src.width, src.height, *src.bounds
-        )
-        dst_arr = np.full((dst_height, dst_width), np.nan, dtype=np.float32)
-
-        reproject(
-            source=src_arr,
-            destination=dst_arr,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            src_nodata=np.nan,
-            dst_transform=dst_transform,
-            dst_crs="EPSG:4326",
-            dst_nodata=np.nan,
-            resampling=Resampling.bilinear,
-        )
-
-    west, south, east, north = array_bounds(dst_height, dst_width, dst_transform)
-    return dst_arr, (south, west, north, east)
+    return style_fn
 
 
-def _rgba_for_leaflet(arr: np.ndarray, vmax: float) -> np.ndarray:
-    cmap = matplotlib.colormaps["afmhot"]
-    norm = mcolors.Normalize(vmin=0, vmax=vmax, clip=True)
-    rgba = (cmap(norm(np.nan_to_num(arr, nan=0.0))) * 255).astype(np.uint8)
-    rgba[np.isnan(arr), 3] = 0
-    return rgba
+def _global_county_sum_max() -> float:
+    per_year = {year: _load_county_year_values(year) for year in YEARS}
+    all_geoids: set[str] = set()
+    for d in per_year.values():
+        all_geoids.update(d.keys())
+
+    max_sum = 0.0
+    for geoid in all_geoids:
+        s = sum(per_year[year].get(geoid, 0.0) for year in YEARS)
+        max_sum = max(max_sum, float(s))
+    return max_sum if max_sum > 0 else 1.0
 
 
 def build_leaflet_map() -> Path:
@@ -116,35 +132,44 @@ def build_leaflet_map() -> Path:
     states = states[~states["STUSPS"].isin(DROP_STUSPS)].copy()
     counties = counties[counties["STATEFP"].isin(states["STATEFP"])].copy()
 
-    max_val = _global_raster_max()
-    cmap = afmhot_colormap(0, max_val)
-    cmap.caption = "Days above AQI 100 (IDW interpolation)"
+    max_val = _global_county_sum_max()
+    cmap = leaflet_colormap(0, max_val, cmap_name=LEAFLET_CMAP_NAME)
+    cmap.caption = "County days above AQI 100 (sum across selected years)"
 
     m = folium.Map(location=[39.5, -98.35], zoom_start=4, tiles="CartoDB positron")
 
-    # County borders as context layer.
-    folium.GeoJson(
-        data=counties.to_json(),
-        name="County borders",
-        style_function=lambda _: {"color": "#666666", "weight": 0.35, "fillOpacity": 0.0},
-    ).add_to(m)
-
+    year_cols: list[str] = []
     for year in YEARS:
-        fg = folium.FeatureGroup(name=f"{year}", show=(year == YEARS[-1]))
-        for region, tif_path in _tif_paths_for_year(year).items():
-            if not tif_path.exists():
-                continue
-            arr, (south, west, north, east) = _reproject_to_wgs84(tif_path)
-            rgba = _rgba_for_leaflet(arr, vmax=max_val)
-            folium.raster_layers.ImageOverlay(
-                image=rgba,
-                bounds=[[south, west], [north, east]],
-                opacity=0.75,
-                interactive=False,
-                name=f"{region} {year}",
-            ).add_to(fg)
+        value_by_geoid = _load_county_year_values(year)
+        col = f"y{year}"
+        year_cols.append(col)
+        counties[col] = counties["GEOID"].map(value_by_geoid).astype(float)
+        counties[f"label_{year}"] = counties[col].map(
+            lambda v: f"{int(round(v))}" if pd.notna(v) else "No monitor data"
+        )
 
+    year_layers: dict[int, folium.FeatureGroup] = {}
+    for year in YEARS:
+        fg = folium.FeatureGroup(name=str(year), show=(year == YEARS[-1]))
         fg.add_to(m)
+        year_layers[year] = fg
+
+    tooltip_fields = ["NAME"] + [f"label_{year}" for year in YEARS]
+    tooltip_aliases = ["County"] + [f"Days above AQI 100 ({year})" for year in YEARS]
+    county_geojson = folium.GeoJson(
+        data=counties.to_json(),
+        name="County totals",
+        control=False,
+        style_function=_style_fn_factory([f"y{YEARS[-1]}"], cmap),
+        tooltip=folium.GeoJsonTooltip(
+            fields=tooltip_fields,
+            aliases=tooltip_aliases,
+            localize=True,
+            sticky=False,
+            labels=True,
+        ),
+    )
+    county_geojson.add_to(m)
 
     # State borders as a crisp overlay.
     folium.GeoJson(
@@ -155,6 +180,85 @@ def build_leaflet_map() -> Path:
 
     cmap.add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
+
+    cmap_obj = matplotlib.colormaps[LEAFLET_CMAP_NAME]
+    stops = [mcolors.to_hex(cmap_obj(i)) for i in np.linspace(0, 1, 11)]
+    layer_items = ",\n".join(
+        [f'      "{year}": {year_layers[year].get_name()}' for year in YEARS]
+    )
+    year_cols_js = ", ".join([f'"{year}": "y{year}"' for year in YEARS])
+    js = f"""
+<script>
+(function() {{
+  var map = {m.get_name()};
+  var countyLayer = {county_geojson.get_name()};
+  var yearLayers = {{
+{layer_items}
+  }};
+  var yearCols = {{{year_cols_js}}};
+  var vmin = 0.0;
+  var vmax = {max_val:.6f};
+  var colorStops = {stops};
+
+  function colorForValue(v) {{
+    if (v <= 0) return "#d9d9d9";
+    if (vmax <= vmin) return colorStops[colorStops.length - 1];
+    var t = (v - vmin) / (vmax - vmin);
+    t = Math.max(0, Math.min(1, t));
+    var idx = Math.floor(t * (colorStops.length - 1));
+    return colorStops[idx];
+  }}
+
+  function activeYears() {{
+    var years = [];
+    Object.keys(yearLayers).forEach(function(y) {{
+      if (map.hasLayer(yearLayers[y])) years.push(y);
+    }});
+    return years;
+  }}
+
+  function styleFromActive(feature, years) {{
+    var props = feature.properties || {{}};
+    var hasData = false;
+    var total = 0;
+    years.forEach(function(y) {{
+      var col = yearCols[y];
+      var val = props[col];
+      if (val !== null && val !== undefined) {{
+        hasData = true;
+        total += Number(val);
+      }}
+    }});
+    if (!hasData || total <= 0) {{
+      return {{
+        fillColor: "#d9d9d9",
+        fillOpacity: 0.20,
+        color: "#666666",
+        weight: 0.25
+      }};
+    }}
+    return {{
+      fillColor: colorForValue(total),
+      fillOpacity: 0.78,
+      color: "#4a4a4a",
+      weight: 0.25
+    }};
+  }}
+
+  function refreshCountyStyles() {{
+    var years = activeYears();
+    countyLayer.setStyle(function(feature) {{
+      return styleFromActive(feature, years);
+    }});
+  }}
+
+  map.on("overlayadd", refreshCountyStyles);
+  map.on("overlayremove", refreshCountyStyles);
+  refreshCountyStyles();
+}})();
+</script>
+"""
+    m.get_root().html.add_child(Element(js))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_html = OUT_DIR / "aqi_days_above_100_county_leaflet.html"
