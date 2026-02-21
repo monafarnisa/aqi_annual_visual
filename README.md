@@ -7,8 +7,8 @@ Script to interpolate **days above AQI 100** per year (2020–2025) from sesnsor
 1. **Clean** daily AQI data and aggregate to **days above AQI 100** per monitor per year.
 2. **Interpolate** with **Inverse Distance Weighted (IDW)** to create continuous surfaces.
 3. **Visualize**:  
-   - **Viz 1:** Trend chart — mean days above AQI 100 per year (2020–2025).  
-   - **Viz 2–7:** One map per year (2020–2025) showing the IDW surface (or monitor points if no IDW).
+   - ** One map per year (2020–2025) showing the IDW surface (or monitor points if no IDW).
+   - ** An interactive html leaflet to zoom into county level and identify days above AQI > 100. 
 
 ## Setup
 
@@ -21,7 +21,7 @@ pip install -r requirements.txt
 
 ## Data
 
-- **EPA AirData** daily files: [Download Daily AQI Data by County](https://aqs.epa.gov/aqsweb/airdata/daily_aqi_by_county_2025.zip) for each year from 2020 - 2025.
+- **EPA AirData** daily files: [Download Daily AQI Data by County](https://aqs.epa.gov/aqsweb/airdata/download_files.html#Daily) for each year from 2020 - 2025.
 - Place CSVs in `data/raw/` with names like:
 
 ### Including your 5 CSV files (~25 MB each)
